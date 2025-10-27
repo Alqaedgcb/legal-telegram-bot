@@ -14,13 +14,20 @@
 # 🚀 Fake web server for Render
 # -------------------------------
 from flask import Flask
+from threading import Thread
+
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Legal Bot is running!"
 
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
 if __name__ == "__main__":
-    from threading import Thread
-    Thread(target=lambda: app.run(host="0.0.0.0", port=10000)).start()
+    # شغل السيرفر الوهمي في خلفية
+    Thread(target=run_flask).start()
+
+    # شغل البوت القانوني
     main()
