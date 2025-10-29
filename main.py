@@ -253,3 +253,28 @@ if __name__ == "__main__":
     # شغّل السيرفر الوهمي في الخلفية ثم شغّل البوت
     Thread(target=run_flask, daemon=True).start()
     main()
+    def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve|reject)_"))
+    application.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^(consultation|services|about|appointment)$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("🤖 البوت القانوني يعمل الآن...")
+    application.run_polling()
+
+from flask import Flask
+from threading import Thread
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Legal Bot is running!"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+if __name__ == "__main__":
+    Thread(target=run_flask, daemon=True).start()
+    main()
