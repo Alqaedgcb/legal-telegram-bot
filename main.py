@@ -1,235 +1,333 @@
-# ===========================
-# 🤖 Legal Consultation Bot (v2.1)
-# متوافق مع python-telegram-bot 21.3 و Render
-# ===========================
-
 import os
 import logging
-import asyncio
-from threading import Thread
-from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from flask import Flask, request, jsonify
+import requests
+import json
 
-# ⚠️ ضع بياناتك
-BOT_TOKEN = "ضع_توكن_البوت_هنا"
-MANAGER_CHAT_ID = "ضع_معرفك_هنا"  # معرف المدير (رقم ID)
+# الإعدادات
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+MANAGER_CHAT_ID = os.getenv('MANAGER_CHAT_ID')
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# 🗂️ قواعد البيانات البسيطة
+app = Flask(__name__)
+
+# تخزين البيانات
 users_db = {}
-pending_approvals = {}
 user_warnings = {}
 
-# إعدادات اللوج
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ===========================
-# 🧭 أوامر البوت الأساسية
-# ===========================
+def send_telegram_message(chat_id, text, reply_markup=None):
+    """إرسال رسالة عبر Telegram API مباشرة"""
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {
+        'chat_id': chat_id,
+        'text': text
+    }
+    
+    if reply_markup:
+        payload['reply_markup'] = json.dumps(reply_markup)
+    
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Failed to send message: {e}")
+        return False
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
+def edit_telegram_message(chat_id, message_id, text):
+    """تعديل رسالة موجودة"""
+    url = f"{TELEGRAM_API}/editMessageText"
+    payload = {
+        'chat_id': chat_id,
+        'message_id': message_id,
+        'text': text
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Failed to edit message: {e}")
+        return False
 
-    # التحقق من الحظر
-    if user_id in users_db and users_db[user_id].get("banned"):
-        await update.message.reply_text("❌ تم حظرك من استخدام البوت.")
+def answer_callback_query(callback_query_id):
+    """الرد على callback query"""
+    url = f"{TELEGRAM_API}/answerCallbackQuery"
+    payload = {
+        'callback_query_id': callback_query_id
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=5)
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Failed to answer callback: {e}")
+        return False
+
+@app.route('/')
+def index():
+    return "✅ البوت القانوني يعمل بنظام Webhook المباشر!"
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """معالجة webhook من التليجرام"""
+    try:
+        data = request.get_json()
+        logger.info(f"Received update: {data}")
+        
+        if 'message' in data:
+            handle_message(data['message'])
+        elif 'callback_query' in data:
+            handle_callback(data['callback_query'])
+            
+    except Exception as e:
+        logger.error(f"Error in webhook: {e}")
+    
+    return 'OK'
+
+def handle_message(message):
+    """معالجة الرسائل النصية"""
+    chat_id = message['chat']['id']
+    text = message.get('text', '')
+    user = message['from']
+    user_id = user['id']
+    
+    logger.info(f"Message from {user_id}: {text}")
+    
+    if text == '/start':
+        handle_start_command(user, chat_id)
+    elif text and not text.startswith('/'):
+        handle_user_text(user_id, chat_id, text)
+
+def handle_start_command(user, chat_id):
+    """معالجة أمر /start"""
+    user_id = user['id']
+    
+    # التحقق إذا كان محظوراً
+    if users_db.get(user_id, {}).get('banned'):
+        send_telegram_message(chat_id, "❌ تم حظرك من استخدام البوت.")
         return
-
-    # التحقق من الموافقة
-    if user_id not in users_db or not users_db[user_id].get("approved"):
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ قبول المستخدم", callback_data=f"approve_{user_id}"),
-                InlineKeyboardButton("❌ رفض المستخدم", callback_data=f"reject_{user_id}")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        try:
-            await context.bot.send_message(
-                chat_id=MANAGER_CHAT_ID,
-                text=f"🆕 طلب انضمام جديد:\n\n"
-                     f"👤 {user.first_name} {user.last_name or ''}\n"
-                     f"📛 @{user.username or 'غير متوفر'}\n"
-                     f"🆔 {user_id}\n\n"
-                     f"اختر الإجراء:",
-                reply_markup=reply_markup
-            )
-
-            pending_approvals[user_id] = {
-                "first_name": user.first_name,
-                "last_name": user.last_name,
-                "username": user.username
-            }
-
-            await update.message.reply_text(
-                "⏳ تم إرسال طلب الانضمام إلى الإدارة.\n"
-                "سيتم إعلامك عند الموافقة على طلبك."
-            )
-
-        except Exception as e:
-            await update.message.reply_text("❌ حدث خطأ في الإعدادات.")
-            logger.error(f"Error in start: {e}")
+        
+    # إذا لم يكن معتمداً بعد
+    if user_id not in users_db or not users_db[user_id].get('approved'):
+        # إنشاء أزرار الموافقة
+        keyboard = {
+            'inline_keyboard': [[
+                {
+                    'text': '✅ قبول المستخدم',
+                    'callback_data': f'approve_{user_id}'
+                },
+                {
+                    'text': '❌ رفض المستخدم', 
+                    'callback_data': f'reject_{user_id}'
+                }
+            ]]
+        }
+        
+        # إرسال طلب للمدير
+        send_telegram_message(
+            MANAGER_CHAT_ID,
+            f"🆕 طلب انضمام جديد:\n\n"
+            f"👤 المستخدم: {user['first_name']}\n"
+            f"📛 username: @{user.get('username', 'غير متوفر')}\n"
+            f"🆔 ID: {user_id}\n\n"
+            f"اختر الإجراء المناسب:",
+            keyboard
+        )
+        
+        # حفظ بيانات المستخدم
+        users_db[user_id] = {
+            'first_name': user['first_name'],
+            'username': user.get('username'),
+            'status': 'pending',
+            'chat_id': chat_id
+        }
+        
+        send_telegram_message(chat_id, "⏳ تم إرسال طلب الانضمام للإدارة.\nسيتم إعلامك عند الموافقة.")
+        
     else:
-        await show_main_menu(update, context)
+        # إذا كان معتمداً، عرض القائمة
+        show_main_menu(chat_id)
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("📞 استشارة قانونية فورية", callback_data="consultation")],
-        [InlineKeyboardButton("⚖️ أنواع الخدمات القانونية", callback_data="services")],
-        [InlineKeyboardButton("🏢 عن المكتب والمحامين", callback_data="about")],
-        [InlineKeyboardButton("📝 حجز موعد استشارة", callback_data="appointment")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    text = (
-        "👋 أهلاً وسهلاً بك في البوت القانوني المتخصص.\n\n"
-        "اختر الخدمة التي تناسب احتياجك:"
+def show_main_menu(chat_id):
+    """عرض القائمة الرئيسية"""
+    keyboard = {
+        'inline_keyboard': [
+            [{'text': '📞 استشارة فورية', 'callback_data': 'consult'}],
+            [{'text': '⚖️ خدمات قانونية', 'callback_data': 'services'}],
+            [{'text': 'ℹ️ معلومات', 'callback_data': 'about'}],
+            [{'text': '📝 حجز موعد', 'callback_data': 'appointment'}]
+        ]
+    }
+    
+    send_telegram_message(
+        chat_id,
+        "👋 أهلاً وسهلاً بك في البوت القانوني المتخصص\n\nاختر الخدمة التي تناسب احتياجك:",
+        keyboard
     )
 
-    if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup)
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+def handle_callback(callback_query):
+    """معالجة ضغطات الأزرار"""
+    data = callback_query['data']
+    user_id = callback_query['from']['id']
+    message_id = callback_query['message']['message_id']
+    chat_id = callback_query['message']['chat']['id']
+    
+    # الرد على callback (إزالة حالة التحميل)
+    answer_callback_query(callback_query['id'])
+    
+    try:
+        if data.startswith('approve_'):
+            target_user_id = int(data.split('_')[1])
+            users_db[target_user_id] = {
+                'approved': True,
+                'warnings': 0,
+                'first_name': users_db.get(target_user_id, {}).get('first_name', ''),
+                'username': users_db.get(target_user_id, {}).get('username', '')
+            }
+            
+            # إرسال رسالة للمستخدم
+            user_chat_id = users_db.get(target_user_id, {}).get('chat_id', target_user_id)
+            send_telegram_message(
+                user_chat_id,
+                "🎉 تم قبول طلب انضمامك!\n\nيمكنك الآن استخدام كافة خدمات البوت القانوني.\nاكتب /start لرؤية القائمة الرئيسية."
+            )
+            
+            # تحديث رسالة المدير
+            edit_telegram_message(
+                chat_id,
+                message_id,
+                f"✅ تم قبول المستخدم {target_user_id}"
+            )
+            
+        elif data.startswith('reject_'):
+            target_user_id = int(data.split('_')[1])
+            users_db[target_user_id] = {'banned': True}
+            
+            # إرسال رسالة للمستخدم
+            user_chat_id = users_db.get(target_user_id, {}).get('chat_id', target_user_id)
+            send_telegram_message(user_chat_id, "❌ نأسف، تم رفض طلب انضمامك للبوت القانوني.")
+            
+            # تحديث رسالة المدير
+            edit_telegram_message(
+                chat_id,
+                message_id,
+                f"❌ تم رفض المستخدم {target_user_id}"
+            )
+            
+        elif data == "consult":
+            edit_telegram_message(
+                chat_id,
+                message_id,
+                "📞 الاستشارة القانونية الفورية:\n\nيمكنك الآن وصف مشكلتك القانونية بالتفصيل، وسيقوم أحد محامينا المتخصصين بالرد عليك في أقرب وقت.\n\n⬇️ اكتب رسالتك الآن..."
+            )
+            
+        elif data == "services":
+            edit_telegram_message(
+                chat_id,
+                message_id,
+                "⚖️ خدماتنا القانونية المتكاملة:\n\n• 📝 صياغة العقود والاتفاقيات\n• 🏛️ المرافعات والدفوع القضائية\n• 💼 الاستشارات القانونية المتخصصة\n• 📄 التوثيق والتصديق القانوني\n• ⚔️ القضايا والمنازعات القانونية\n• 🏠 قضايا العقارات والأملاك\n• 👨‍👩‍👧‍👦 قضايا الأحوال الشخصية\n• 💰 القضايا التجارية والمالية\n\nاختر 'استشارة فورية' لبدء الخدمة المناسبة لك."
+            )
+            
+        elif data == "about":
+            edit_telegram_message(
+                chat_id,
+                message_id,
+                "🏢 مكتب المحاماة المتخصص:\n\nنحن فريق من المحامين المتخصصين في مختلف المجالات القانونية، نقدم خدماتنا باحترافية وشفافية.\n\n📞 للتواصل المباشر:\nالهاتف: +966123456789\nالبريد الإلكتروني: info@lawfirm.com\n\n🕐 أوقات العمل:\nمن الأحد إلى الخميس\n8:00 ص - 6:00 م"
+            )
+            
+        elif data == "appointment":
+            edit_telegram_message(
+                chat_id,
+                message_id,
+                "📝 حجز موعد استشارة:\n\nلحجز موعد مع محامٍ متخصص، يرجى:\n\n📞 الاتصال على: +966123456789\n📧 المراسلة على: appointments@lawfirm.com\n\nأو يمكنك إرسال:\n• الاسم الكامل\n• نوع الاستشارة\n• التاريخ والوقت المناسب\nوسنتواصل معك لتأكيد الموعد."
+            )
+            
+    except Exception as e:
+        logger.error(f"خطأ في معالجة الزر: {e}")
 
-async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    action, user_id = query.data.split("_")
-    user_id = int(user_id)
-
-    if action == "approve":
-        users_db[user_id] = {"approved": True, "warnings": 0}
-        pending_approvals.pop(user_id, None)
-
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="🎉 تم قبول طلبك! يمكنك الآن استخدام جميع خدمات البوت.\nاكتب /start للبدء."
-        )
-        await query.edit_message_text(f"✅ تم قبول المستخدم {user_id}")
-
-    elif action == "reject":
-        pending_approvals.pop(user_id, None)
-        await context.bot.send_message(chat_id=user_id, text="❌ تم رفض طلبك.")
-        await query.edit_message_text(f"❌ تم رفض المستخدم {user_id}")
-
-async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    choice = query.data
-
-    if choice == "consultation":
-        await query.edit_message_text(
-            "📞 أرسل مشكلتك القانونية بالتفصيل.\n"
-            "سيقوم أحد المحامين بالرد عليك قريباً."
-        )
-
-    elif choice == "services":
-        await query.edit_message_text(
-            "⚖️ خدماتنا القانونية:\n\n"
-            "• 📝 صياغة العقود\n"
-            "• 🏛️ المرافعات القضائية\n"
-            "• 💼 الاستشارات القانونية\n"
-            "• 📄 التوثيق القانوني\n"
-            "• ⚔️ القضايا التجارية والعقارية"
-        )
-
-    elif choice == "about":
-        await query.edit_message_text(
-            "🏢 مكتب المحاماة المتخصص:\n\n"
-            "نحن فريق من المحامين المعتمدين بخبرة طويلة.\n\n"
-            "📞  +966123456789\n"
-            "📧  info@lawfirm.com"
-        )
-
-    elif choice == "appointment":
-        await query.edit_message_text(
-            "📝 لحجز موعد، أرسل اسمك ونوع القضية والتاريخ المطلوب."
-        )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.lower()
-
-    if user_id not in users_db or not users_db[user_id].get("approved"):
-        await update.message.reply_text("⏳ لا يمكنك استخدام البوت حتى تتم الموافقة عليك.")
+def handle_user_text(user_id, chat_id, text):
+    """معالجة الرسائل النصية من المستخدمين"""
+    # التحقق من صلاحية المستخدم
+    if user_id not in users_db or not users_db[user_id].get('approved'):
+        send_telegram_message(chat_id, "⏳ لا يمكنك استخدام البوت حتى يتم الموافقة على طلبك.")
         return
-
-    forbidden = ["http://", "https://", ".com", ".org", "سب", "شتم", "قذف"]
-    for bad in forbidden:
-        if bad in text:
-            user_warnings[user_id] = user_warnings.get(user_id, 0) + 1
-            count = user_warnings[user_id]
-            if count >= 3:
-                users_db[user_id]["banned"] = True
-                await update.message.reply_text("❌ تم حظرك بسبب مخالفات متكررة.")
-                await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=f"🚨 تم حظر المستخدم {user_id}")
+    
+    # فحص المحتوى المحظور
+    forbidden_words = ["http://", "https://", ".com", ".org", "سب", "شتم", "قذف", "شتيمة"]
+    for word in forbidden_words:
+        if word in text.lower():
+            # زيادة التحذيرات
+            if user_id not in user_warnings:
+                user_warnings[user_id] = 0
+            user_warnings[user_id] += 1
+            
+            warnings = user_warnings[user_id]
+            
+            if warnings >= 3:
+                # حظر المستخدم
+                users_db[user_id]['banned'] = True
+                send_telegram_message(chat_id, "❌ تم حظرك من البوت due to repeated violations.")
+                
+                # إشعار المدير
+                send_telegram_message(
+                    MANAGER_CHAT_ID,
+                    f"🚨 تم حظر المستخدم {user_id}\nالسبب: repeated violations\nآخر رسالة: {text[:100]}..."
+                )
                 return
             else:
-                await update.message.reply_text(f"⚠️ تحذير ({count}/3): يمنع نشر روابط أو كلمات مسيئة.")
-                await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=f"⚠️ مخالفة من المستخدم {user_id}")
+                send_telegram_message(
+                    chat_id,
+                    f"⚠️ تحذير ({warnings}/3): يمنع مشاركة روابط أو كلمات غير لائقة.\nالتكرار يؤدي إلى الحظر الدائم."
+                )
+                
+                # إشعار المدير
+                send_telegram_message(
+                    MANAGER_CHAT_ID,
+                    f"⚠️ مخالفة من المستخدم {user_id}\nالتحذيرات: {warnings}/3\nالرسالة: {text[:200]}..."
+                )
                 return
+    
+    # إذا كانت الرسالة نظيفة
+    send_telegram_message(
+        chat_id,
+        "✅ تم استلام رسالتك بنجاح.\n\nسيقوم أحد محامينا المتخصصين بالرد عليك في أقرب وقت ممكن.\n\nشكراً لثقتك بمكتبنا القانوني."
+    )
 
-    await update.message.reply_text("✅ تم استلام رسالتك، وسيتم الرد عليك قريباً.")
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    """تعيين webhook"""
+    try:
+        webhook_url = f"https://{app.name}.onrender.com/webhook"
+        url = f"{TELEGRAM_API}/setWebhook"
+        payload = {
+            'url': webhook_url
+        }
+        response = requests.post(url, json=payload)
+        
+        if response.status_code == 200:
+            return f"✅ تم تعيين webhook: {webhook_url}"
+        else:
+            return f"❌ فشل تعيين webhook: {response.text}"
+    except Exception as e:
+        return f"❌ خطأ: {e}"
 
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != MANAGER_CHAT_ID:
-        return
-    if context.args:
-        try:
-            uid = int(context.args[0])
-            users_db[uid] = {"banned": True}
-            await update.message.reply_text(f"✅ تم حظر المستخدم {uid}")
-        except:
-            await update.message.reply_text("❌ رقم غير صالح.")
+@app.route('/delete_webhook', methods=['GET'])
+def delete_webhook():
+    """حذف webhook"""
+    try:
+        url = f"{TELEGRAM_API}/deleteWebhook"
+        response = requests.post(url)
+        
+        if response.status_code == 200:
+            return "✅ تم حذف webhook"
+        else:
+            return f"❌ فشل حذف webhook: {response.text}"
+    except Exception as e:
+        return f"❌ خطأ: {e}"
 
-# ===========================
-# 🚀 تشغيل البوت والسيرفر معاً
-# ===========================
-
-def main():
-    async def run_bot():
-        app = (
-            Application.builder()
-            .token(BOT_TOKEN)
-            .build()
-        )
-
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("ban", ban_command))
-        app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve|reject)_"))
-        app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^(consultation|services|about|appointment)$"))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-        print("🤖 البوت القانوني يعمل الآن...")
-        await app.run_polling()
-
-    asyncio.run(run_bot())
-
-
-# ===========================
-# 🌐 Fake web server for Render
-# ===========================
-
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
-def home():
-    return "✅ Legal Consultation Bot is Running!"
-
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=10000)
-
-if __name__ == "__main__":
-    Thread(target=run_flask).start()
-    main()
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
