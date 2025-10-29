@@ -1,49 +1,51 @@
 # ===========================
-# 🤖 Legal Consultation Bot with Auto-Restart + Admin Alerts
+# 🤖 Legal Consultation Bot (v2.1)
+# متوافق مع python-telegram-bot 21.3 و Render
 # ===========================
+
 import os
 import logging
-import time
 import asyncio
-from datetime import datetime
 from threading import Thread
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters,
 )
 
-# ⚙️ إعداد المتغيرات
-BOT_TOKEN = "8228823766:AAEd-LfKPPkGmurbNSQdBkNgEVpwpw_Lre8"
-MANAGER_CHAT_ID = "1101452818"
+# ⚠️ ضع بياناتك
+BOT_TOKEN = "ضع_توكن_البوت_هنا"
+MANAGER_CHAT_ID = "ضع_معرفك_هنا"  # معرف المدير (رقم ID)
 
-# قواعد بيانات مؤقتة
+# 🗂️ قواعد البيانات البسيطة
 users_db = {}
 pending_approvals = {}
 user_warnings = {}
 
-# إعداد السجلات
+# إعدادات اللوج
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==============================
-# 🧩 وظائف البوت الأساسية
-# ==============================
+# ===========================
+# 🧭 أوامر البوت الأساسية
+# ===========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
-    if user_id in users_db and users_db[user_id].get('banned'):
+    # التحقق من الحظر
+    if user_id in users_db and users_db[user_id].get("banned"):
         await update.message.reply_text("❌ تم حظرك من استخدام البوت.")
         return
 
-    if user_id not in users_db or not users_db[user_id].get('approved'):
+    # التحقق من الموافقة
+    if user_id not in users_db or not users_db[user_id].get("approved"):
         keyboard = [
             [
                 InlineKeyboardButton("✅ قبول المستخدم", callback_data=f"approve_{user_id}"),
@@ -51,27 +53,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
+
         try:
             await context.bot.send_message(
                 chat_id=MANAGER_CHAT_ID,
-                text=(
-                    f"🆕 طلب انضمام جديد:\n\n"
-                    f"👤 {user.first_name} {user.last_name or ''}\n"
-                    f"📛 @{user.username or 'غير متوفر'}\n"
-                    f"🆔 {user_id}\n\n"
-                    f"اختر الإجراء:"
-                ),
+                text=f"🆕 طلب انضمام جديد:\n\n"
+                     f"👤 {user.first_name} {user.last_name or ''}\n"
+                     f"📛 @{user.username or 'غير متوفر'}\n"
+                     f"🆔 {user_id}\n\n"
+                     f"اختر الإجراء:",
                 reply_markup=reply_markup
             )
+
             pending_approvals[user_id] = {
-                'first_name': user.first_name,
-                'last_name': user.last_name,
-                'username': user.username
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "username": user.username
             }
-            await update.message.reply_text("⏳ تم إرسال طلبك إلى الإدارة، يرجى انتظار الموافقة.")
+
+            await update.message.reply_text(
+                "⏳ تم إرسال طلب الانضمام إلى الإدارة.\n"
+                "سيتم إعلامك عند الموافقة على طلبك."
+            )
+
         except Exception as e:
-            await update.message.reply_text("❌ خطأ في الاتصال بالإدارة.")
-            logger.error(e)
+            await update.message.reply_text("❌ حدث خطأ في الإعدادات.")
+            logger.error(f"Error in start: {e}")
     else:
         await show_main_menu(update, context)
 
@@ -83,7 +90,11 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📝 حجز موعد استشارة", callback_data="appointment")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    text = "👋 أهلاً بك في البوت القانوني الذكي.\nاختر الخدمة المطلوبة:"
+
+    text = (
+        "👋 أهلاً وسهلاً بك في البوت القانوني المتخصص.\n\n"
+        "اختر الخدمة التي تناسب احتياجك:"
+    )
 
     if update.message:
         await update.message.reply_text(text, reply_markup=reply_markup)
@@ -93,14 +104,19 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action, user_id = query.data.split('_')
+
+    action, user_id = query.data.split("_")
     user_id = int(user_id)
 
     if action == "approve":
-        users_db[user_id] = {'approved': True, 'warnings': 0}
+        users_db[user_id] = {"approved": True, "warnings": 0}
         pending_approvals.pop(user_id, None)
-        await context.bot.send_message(chat_id=user_id, text="🎉 تم قبولك! اكتب /start للبدء.")
-        await query.edit_message_text(f"✅ تمت الموافقة على المستخدم {user_id}")
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="🎉 تم قبول طلبك! يمكنك الآن استخدام جميع خدمات البوت.\nاكتب /start للبدء."
+        )
+        await query.edit_message_text(f"✅ تم قبول المستخدم {user_id}")
 
     elif action == "reject":
         pending_approvals.pop(user_id, None)
@@ -110,32 +126,52 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    choice = query.data
 
-    if data == "consultation":
-        await query.edit_message_text("📞 أرسل وصف مشكلتك القانونية بالتفصيل وسيتواصل معك أحد المحامين.")
-    elif data == "services":
-        await query.edit_message_text("⚖️ خدماتنا:\n• صياغة العقود\n• المرافعات\n• الاستشارات\n• القضايا التجارية والعقارية")
-    elif data == "about":
-        await query.edit_message_text("🏢 مكتب المحاماة:\nنحن محامون متخصصون في مختلف القضايا.\n📞 +967776086053\n📧 info@lawfirm.com")
-    elif data == "appointment":
-        await query.edit_message_text("📝 للحجز، أرسل اسمك ونوع القضية والتاريخ المطلوب.")
+    if choice == "consultation":
+        await query.edit_message_text(
+            "📞 أرسل مشكلتك القانونية بالتفصيل.\n"
+            "سيقوم أحد المحامين بالرد عليك قريباً."
+        )
+
+    elif choice == "services":
+        await query.edit_message_text(
+            "⚖️ خدماتنا القانونية:\n\n"
+            "• 📝 صياغة العقود\n"
+            "• 🏛️ المرافعات القضائية\n"
+            "• 💼 الاستشارات القانونية\n"
+            "• 📄 التوثيق القانوني\n"
+            "• ⚔️ القضايا التجارية والعقارية"
+        )
+
+    elif choice == "about":
+        await query.edit_message_text(
+            "🏢 مكتب المحاماة المتخصص:\n\n"
+            "نحن فريق من المحامين المعتمدين بخبرة طويلة.\n\n"
+            "📞  +966123456789\n"
+            "📧  info@lawfirm.com"
+        )
+
+    elif choice == "appointment":
+        await query.edit_message_text(
+            "📝 لحجز موعد، أرسل اسمك ونوع القضية والتاريخ المطلوب."
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.lower()
 
-    if user_id not in users_db or not users_db[user_id].get('approved'):
-        await update.message.reply_text("⏳ لا يمكنك استخدام البوت حتى يتم الموافقة عليك.")
+    if user_id not in users_db or not users_db[user_id].get("approved"):
+        await update.message.reply_text("⏳ لا يمكنك استخدام البوت حتى تتم الموافقة عليك.")
         return
 
-    forbidden = ["http://", "https://", ".com", "سب", "شتم", "قذف"]
+    forbidden = ["http://", "https://", ".com", ".org", "سب", "شتم", "قذف"]
     for bad in forbidden:
         if bad in text:
             user_warnings[user_id] = user_warnings.get(user_id, 0) + 1
             count = user_warnings[user_id]
             if count >= 3:
-                users_db[user_id]['banned'] = True
+                users_db[user_id]["banned"] = True
                 await update.message.reply_text("❌ تم حظرك بسبب مخالفات متكررة.")
                 await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=f"🚨 تم حظر المستخدم {user_id}")
                 return
@@ -144,7 +180,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=f"⚠️ مخالفة من المستخدم {user_id}")
                 return
 
-    await update.message.reply_text("✅ تم استلام رسالتك، سيتم الرد عليك قريباً.")
+    await update.message.reply_text("✅ تم استلام رسالتك، وسيتم الرد عليك قريباً.")
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != MANAGER_CHAT_ID:
@@ -152,67 +188,48 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         try:
             uid = int(context.args[0])
-            users_db[uid] = {'banned': True}
+            users_db[uid] = {"banned": True}
             await update.message.reply_text(f"✅ تم حظر المستخدم {uid}")
         except:
             await update.message.reply_text("❌ رقم غير صالح.")
 
-# ==============================
-# 🚀 Auto-Restart + إشعارات للمدير
-# ==============================
+# ===========================
+# 🚀 تشغيل البوت والسيرفر معاً
+# ===========================
 
-def start_bot():
-    async def run():
-        application = Application.builder().token(BOT_TOKEN).build()
-
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("ban", ban_command))
-        application.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve|reject)_"))
-        application.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^(consultation|services|about|appointment)$"))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-        # إشعار للمدير عند التشغيل الناجح
-        bot = Bot(token=BOT_TOKEN)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        await bot.send_message(
-            chat_id=MANAGER_CHAT_ID,
-            text=f"✅ تم تشغيل البوت القانوني بنجاح على Render\n🕒 الوقت: {now}"
+def main():
+    async def run_bot():
+        app = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .build()
         )
 
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("ban", ban_command))
+        app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve|reject)_"))
+        app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^(consultation|services|about|appointment)$"))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
         print("🤖 البوت القانوني يعمل الآن...")
-        await application.run_polling()
+        await app.run_polling()
 
-    while True:
-        try:
-            asyncio.run(run())
-        except Exception as e:
-            logger.error(f"⚠️ حدث خطأ: {e}")
-            print("🔁 إعادة تشغيل البوت خلال 5 ثوانٍ...")
+    asyncio.run(run_bot())
 
-            try:
-                bot = Bot(token=BOT_TOKEN)
-                asyncio.run(bot.send_message(
-                    chat_id=MANAGER_CHAT_ID,
-                    text=f"⚠️ تم إعادة تشغيل البوت تلقائيًا بعد حدوث خطأ:\n\n{e}"
-                ))
-            except Exception as notify_err:
-                logger.error(f"❌ فشل في إرسال إشعار الخطأ: {notify_err}")
 
-            time.sleep(5)
-            continue
-
-# ==============================
+# ===========================
 # 🌐 Fake web server for Render
-# ==============================
-app = Flask(__name__)
+# ===========================
 
-@app.route('/')
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
 def home():
-    return "✅ Legal Bot is running (Auto-Restart + Admin Alerts)"
+    return "✅ Legal Consultation Bot is Running!"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=10000)
+    flask_app.run(host="0.0.0.0", port=10000)
 
 if __name__ == "__main__":
     Thread(target=run_flask).start()
-    start_bot()
+    main()
