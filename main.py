@@ -1,27 +1,39 @@
 # ===========================
-# 🤖 Legal Consultation Bot
+# 🤖 Legal Consultation Bot with Auto-Restart + Admin Alerts
 # ===========================
-
 import os
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+import time
+import asyncio
+from datetime import datetime
+from threading import Thread
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 
-# ⚠️ ضع هنا معلوماتك الخاصة
+# ⚙️ إعداد المتغيرات
 BOT_TOKEN = "8228823766:AAEd-LfKPPkGmurbNSQdBkNgEVpwpw_Lre8"
 MANAGER_CHAT_ID = "1101452818"
 
-# قواعد البيانات المؤقتة
+# قواعد بيانات مؤقتة
 users_db = {}
 pending_approvals = {}
 user_warnings = {}
 
+# إعداد السجلات
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ===========================
-# 🟢 الأوامر والوظائف الأساسية
-# ===========================
+# ==============================
+# 🧩 وظائف البوت الأساسية
+# ==============================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -39,7 +51,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-
         try:
             await context.bot.send_message(
                 chat_id=MANAGER_CHAT_ID,
@@ -52,20 +63,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ),
                 reply_markup=reply_markup
             )
-
             pending_approvals[user_id] = {
                 'first_name': user.first_name,
                 'last_name': user.last_name,
                 'username': user.username
             }
-
             await update.message.reply_text("⏳ تم إرسال طلبك إلى الإدارة، يرجى انتظار الموافقة.")
         except Exception as e:
             await update.message.reply_text("❌ خطأ في الاتصال بالإدارة.")
             logger.error(e)
     else:
         await show_main_menu(update, context)
-
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -75,15 +83,12 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📝 حجز موعد استشارة", callback_data="appointment")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    text = """👋 أهلاً بك في البوت القانوني الذكي.
-اختر الخدمة المطلوبة:"""
+    text = "👋 أهلاً بك في البوت القانوني الذكي.\nاختر الخدمة المطلوبة:"
 
     if update.message:
         await update.message.reply_text(text, reply_markup=reply_markup)
     else:
         await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
-
 
 async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -102,32 +107,19 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text="❌ تم رفض طلبك.")
         await query.edit_message_text(f"❌ تم رفض المستخدم {user_id}")
 
-
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
     if data == "consultation":
-        await query.edit_message_text(
-            "📞 أرسل وصف مشكلتك القانونية بالتفصيل وسيتواصل معك أحد المحامين."
-        )
-
+        await query.edit_message_text("📞 أرسل وصف مشكلتك القانونية بالتفصيل وسيتواصل معك أحد المحامين.")
     elif data == "services":
-        await query.edit_message_text(
-            "⚖️ خدماتنا:\n• صياغة العقود\n• المرافعات\n• الاستشارات\n• القضايا التجارية والعقارية"
-        )
-
+        await query.edit_message_text("⚖️ خدماتنا:\n• صياغة العقود\n• المرافعات\n• الاستشارات\n• القضايا التجارية والعقارية")
     elif data == "about":
-        await query.edit_message_text(
-            "🏢 مكتب المحاماة:\nنحن محامون متخصصون في مختلف القضايا.\n📞 +967776086053\n📧 info@lawfirm.com"
-        )
-
+        await query.edit_message_text("🏢 مكتب المحاماة:\nنحن محامون متخصصون في مختلف القضايا.\n📞 +967776086053\n📧 info@lawfirm.com")
     elif data == "appointment":
-        await query.edit_message_text(
-            "📝 للحجز، أرسل اسمك ونوع القضية والتاريخ المطلوب."
-        )
-
+        await query.edit_message_text("📝 للحجز، أرسل اسمك ونوع القضية والتاريخ المطلوب.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -154,7 +146,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ تم استلام رسالتك، سيتم الرد عليك قريباً.")
 
-
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != MANAGER_CHAT_ID:
         return
@@ -166,36 +157,62 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             await update.message.reply_text("❌ رقم غير صالح.")
 
+# ==============================
+# 🚀 Auto-Restart + إشعارات للمدير
+# ==============================
 
-# ===========================
-# 🚀 دالة تشغيل البوت
-# ===========================
-def main():
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("ban", ban_command))
-    application.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve|reject)_"))
-    application.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^(consultation|services|about|appointment)$"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 البوت القانوني يعمل الآن...")
-    application.run_polling()
+def start_bot():
+    async def run():
+        application = Application.builder().token(BOT_TOKEN).build()
 
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("ban", ban_command))
+        application.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve|reject)_"))
+        application.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^(consultation|services|about|appointment)$"))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# ===========================
-# 🌐 سيرفر Render الوهمي
-# ===========================
-from flask import Flask
-from threading import Thread
+        # إشعار للمدير عند التشغيل الناجح
+        bot = Bot(token=BOT_TOKEN)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        await bot.send_message(
+            chat_id=MANAGER_CHAT_ID,
+            text=f"✅ تم تشغيل البوت القانوني بنجاح على Render\n🕒 الوقت: {now}"
+        )
 
+        print("🤖 البوت القانوني يعمل الآن...")
+        await application.run_polling()
+
+    while True:
+        try:
+            asyncio.run(run())
+        except Exception as e:
+            logger.error(f"⚠️ حدث خطأ: {e}")
+            print("🔁 إعادة تشغيل البوت خلال 5 ثوانٍ...")
+
+            try:
+                bot = Bot(token=BOT_TOKEN)
+                asyncio.run(bot.send_message(
+                    chat_id=MANAGER_CHAT_ID,
+                    text=f"⚠️ تم إعادة تشغيل البوت تلقائيًا بعد حدوث خطأ:\n\n{e}"
+                ))
+            except Exception as notify_err:
+                logger.error(f"❌ فشل في إرسال إشعار الخطأ: {notify_err}")
+
+            time.sleep(5)
+            continue
+
+# ==============================
+# 🌐 Fake web server for Render
+# ==============================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Legal Bot is running!"
+    return "✅ Legal Bot is running (Auto-Restart + Admin Alerts)"
 
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
 if __name__ == "__main__":
-    Thread(target=run_flask, daemon=True).start()
-    main()
+    Thread(target=run_flask).start()
+    start_bot()
