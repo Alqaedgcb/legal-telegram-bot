@@ -1,698 +1,459 @@
 import os
 import logging
+import requests
+import json
+import re
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
 import threading
 import time
-import requests
-from flask import Flask, request, jsonify
-import json
+from urllib.parse import urljoin
 
-# الإعدادات
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-MANAGER_CHAT_ID = os.getenv('MANAGER_CHAT_ID')
-APP_URL = "https://legal-telegram-bot-qsvz.onrender.com"
+# تكوين السجلات
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# تخزين البيانات
+# المتغيرات البيئية مع قيم افتراضية آمنة
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
+MANAGER_CHAT_ID = os.getenv('MANAGER_CHAT_ID', '')
+N8N_WEBHOOK_URL = os.getenv('N8N_WEBHOOK_URL', '')
+APP_URL = os.getenv('APP_URL', 'https://legal-telegram-bot-qsvz.onrender.com')
+FASL_AI_ENDPOINT = os.getenv('FASL_AI_ENDPOINT', '')
+
+# تخزين مؤقت آمن للمستخدمين
 users_db = {}
 user_warnings = {}
+user_message_history = {}
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# أنماط الكشف عن المخالفات
+VIOLATION_PATTERNS = [
+    r'(?i)(http|https|www\.|t\.me|telegram\.me)',
+    r'(?i)(سب|شتيمة| insult)',
+    r'(?i)(spam|بريد مزعج)'
+]
+
+class UserManager:
+    """فئة لإدارة حالة المستخدمين بشكل آمن"""
+    
+    @staticmethod
+    def get_user(user_id):
+        """الحصول على بيانات المستخدم بشكل آمن"""
+        try:
+            return users_db.get(str(user_id), {
+                'id': user_id,
+                'first_name': '',
+                'last_name': '',
+                'warnings': 0,
+                'banned': False,
+                'created_at': datetime.now().isoformat()
+            })
+        except Exception as e:
+            logger.error(f"خطأ في الحصول على بيانات المستخدم {user_id}: {e}")
+            return {
+                'id': user_id,
+                'first_name': '',
+                'last_name': '',
+                'warnings': 0,
+                'banned': False,
+                'created_at': datetime.now().isoformat()
+            }
+    
+    @staticmethod
+    def update_user(user_id, **updates):
+        """تحديث بيانات المستخدم بشكل آمن"""
+        try:
+            user_id = str(user_id)
+            if user_id not in users_db:
+                users_db[user_id] = UserManager.get_user(user_id)
+            
+            users_db[user_id].update(updates)
+            users_db[user_id]['updated_at'] = datetime.now().isoformat()
+            return True
+        except Exception as e:
+            logger.error(f"خطأ في تحديث بيانات المستخدم {user_id}: {e}")
+            return False
+    
+    @staticmethod
+    def is_user_banned(user_id):
+        """التحقق من حظر المستخدم"""
+        try:
+            user = UserManager.get_user(user_id)
+            return user.get('banned', False)
+        except Exception as e:
+            logger.error(f"خطأ في التحقق من حظر المستخدم {user_id}: {e}")
+            return False
+
+class SecurityManager:
+    """فئة لإدارة الأمان والكشف عن المخالفات"""
+    
+    @staticmethod
+    def detect_violations(text):
+        """الكشف عن المخالفات في النص"""
+        if not text or not isinstance(text, str):
+            return False, []
+        
+        violations = []
+        text_clean = text.lower().strip()
+        
+        for pattern in VIOLATION_PATTERNS:
+            if re.search(pattern, text_clean):
+                violations.append(pattern)
+        
+        return len(violations) > 0, violations
+    
+    @staticmethod
+    def sanitize_text(text):
+        """تنظيف النص من الأحرف الخطرة"""
+        if not text:
+            return ""
+        
+        # إزالة الأحرف الخطرة مع الحفاظ على الأحرف العربية
+        cleaned = re.sub(r'[^\w\s\u0600-\u06FF@\.\-_]', '', str(text))
+        return cleaned.strip()
+
+class MessageHandler:
+    """فئة لمعالجة الرسائل بشكل آمن"""
+    
+    @staticmethod
+    def send_telegram_message(chat_id, text, parse_mode='HTML', reply_markup=None):
+        """إرسال رسالة إلى Telegram بشكل آمن"""
+        try:
+            if not TELEGRAM_TOKEN:
+                logger.error("❌ رمز Telegram غير موجود")
+                return False
+            
+            if not text or not str(chat_id).strip():
+                logger.error("❌ نص الرسالة أو معرف الدردشة غير صالح")
+                return False
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            payload = {
+                'chat_id': chat_id,
+                'text': text[:4090],  # حدود Telegram
+                'parse_mode': parse_mode
+            }
+            
+            if reply_markup:
+                payload['reply_markup'] = reply_markup
+            
+            response = requests.post(url, json=payload, timeout=15)
+            
+            if response.status_code == 200:
+                logger.info(f"✅ تم إرسال الرسالة إلى الدردشة {chat_id}")
+                return True
+            else:
+                logger.error(f"❌ فشل إرسال الرسالة: {response.status_code} - {response.text}")
+                return False
+                
+        except requests.exceptions.Timeout:
+            logger.error("⏰ انتهت المهلة في إرسال رسالة Telegram")
+            return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"🌐 خطأ في الشبكة أثناء إرسال الرسالة: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ خطأ غير متوقع في إرسال الرسالة: {e}")
+            return False
+    
+    @staticmethod
+    def send_to_fasl_ai(user_id, chat_id, text, user_name=""):
+        """إرسال الرسالة إلى Fasl AI بشكل آمن"""
+        try:
+            if not N8N_WEBHOOK_URL:
+                logger.error("❌ عنوان webhook لـ n8n غير موجود")
+                return False
+            
+            # تنظيف البيانات
+            clean_text = SecurityManager.sanitize_text(text)
+            clean_user_name = SecurityManager.sanitize_text(user_name)
+            
+            if not clean_text:
+                logger.error("❌ النص غير صالح بعد التنظيف")
+                return False
+            
+            payload = {
+                'user_id': str(user_id),
+                'chat_id': str(chat_id),
+                'text': clean_text,
+                'timestamp': datetime.now().isoformat(),
+                'user_info': {
+                    'id': str(user_id),
+                    'first_name': clean_user_name.split(' ')[0] if clean_user_name else '',
+                    'last_name': ' '.join(clean_user_name.split(' ')[1:]) if clean_user_name and ' ' in clean_user_name else ''
+                }
+            }
+            
+            headers = {
+                'Content-Type': 'application/json',
+                'X-Telegram-Token': os.getenv('TELEGRAM_WEBHOOK_SECRET', 'default-secret'),
+                'User-Agent': 'LegalTelegramBot/1.0'
+            }
+            
+            # إضافة محاولات إعادة
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = requests.post(
+                        N8N_WEBHOOK_URL, 
+                        json=payload, 
+                        headers=headers,
+                        timeout=20
+                    )
+                    
+                    if response.status_code in [200, 201, 202]:
+                        logger.info(f"✅ تم إرسال الرسالة إلى Fasl AI للمستخدم {user_id}")
+                        return True
+                    else:
+                        logger.warning(f"⚠️ محاولة {attempt + 1} فشلت مع رمز {response.status_code}")
+                        if attempt < max_retries - 1:
+                            time.sleep(2)  # انتظار قبل إعادة المحاولة
+                        
+                except requests.exceptions.Timeout:
+                    logger.warning(f"⏰ انتهت المهلة في المحاولة {attempt + 1}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"🌐 خطأ شبكة في المحاولة {attempt + 1}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+            
+            logger.error(f"❌ فشل جميع محاولات الإرسال إلى Fasl AI للمستخدم {user_id}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ خطأ غير متوقع في إرسال الرسالة إلى Fasl AI: {e}")
+            return False
+
+class ViolationManager:
+    """فئة لإدارة المخالفات بشكل مركزي"""
+    
+    @staticmethod
+    def handle_violation(user_id, chat_id, text):
+        """معالجة المخالفات بشكل آمن"""
+        try:
+            user_id_str = str(user_id)
+            
+            # تحديث التحذيرات
+            if user_id_str not in user_warnings:
+                user_warnings[user_id_str] = 0
+            
+            user_warnings[user_id_str] += 1
+            warnings = user_warnings[user_id_str]
+            
+            # تسجيل المخالفة
+            violation_data = {
+                'user_id': user_id_str,
+                'chat_id': str(chat_id),
+                'text': SecurityManager.sanitize_text(text)[:500],  # تقليل الطول
+                'timestamp': datetime.now().isoformat(),
+                'warnings_count': warnings
+            }
+            
+            if warnings >= 3:
+                # حظر المستخدم
+                UserManager.update_user(user_id_str, banned=True, banned_at=datetime.now().isoformat())
+                
+                # إرسال رسالة الحظر
+                MessageHandler.send_telegram_message(
+                    chat_id, 
+                    "❌ تم حظرك من البوت due to repeated violations."
+                )
+                
+                # إشعار المدير
+                MessageHandler.send_telegram_message(
+                    MANAGER_CHAT_ID,
+                    f"🚨 تم حظر المستخدم {user_id_str}\n"
+                    f"السبب: repeated violations\n"
+                    f"عدد التحذيرات: {warnings}\n"
+                    f"آخر رسالة: {text[:200]}..."
+                )
+                return True
+            else:
+                # إرسال تحذير
+                MessageHandler.send_telegram_message(
+                    chat_id,
+                    f"⚠️ تحذير ({warnings}/3): يمنع مشاركة روابط أو كلمات غير لائقة.\n"
+                    f"التكرار يؤدي إلى الحظر الدائم."
+                )
+                
+                # إشعار المدير
+                MessageHandler.send_telegram_message(
+                    MANAGER_CHAT_ID,
+                    f"⚠️ مخالفة من المستخدم {user_id_str}\n"
+                    f"التحذيرات: {warnings}/3\n"
+                    f"الرسالة: {text[:200]}..."
+                )
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ خطأ في معالجة المخالفة: {e}")
+            return False
 
 def keep_alive():
-    """إبقاء الخدمة نشطة باستمرار"""
-    def ping():
+    """الحفاظ على نشاط التطبيق"""
+    def run():
         while True:
             try:
-                response = requests.get(f'{APP_URL}/', timeout=10)
-                logger.info(f"✅ Keep-alive ping: {response.status_code}")
+                # طلب بسيط للحفاظ على النشاط
+                if APP_URL:
+                    requests.get(f"{APP_URL}/health", timeout=10)
+                time.sleep(300)  # كل 5 دقائق
             except Exception as e:
-                logger.error(f"❌ Keep-alive failed: {e}")
-            time.sleep(240)  # كل 4 دقائق
+                logger.debug(f"إشعار النشاط: {e}")
+                time.sleep(300)
     
-    thread = threading.Thread(target=ping)
-    thread.daemon = True
+    thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    logger.info("🔄 نظام Keep-alive مفعل")
+    logger.info("🚀 بدء نظام keep-alive")
 
-def send_telegram_message(chat_id, text, reply_markup=None):
-    """إرسال رسالة عبر Telegram API مباشرة"""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': chat_id,
-        'text': text,
-        'parse_mode': 'Markdown'
-    }
-    
-    if reply_markup:
-        payload['reply_markup'] = json.dumps(reply_markup)
-    
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """معالجة webhook من Telegram"""
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        logger.info(f"📤 Message sent to {chat_id}")
-        return response.status_code == 200
+        data = request.get_json()
+        
+        if not data:
+            logger.warning("⚠️ طلب webhook بدون بيانات")
+            return jsonify({'status': 'error', 'message': 'No data received'}), 400
+        
+        logger.info(f"📥 بيانات مستلمة: {json.dumps(data, ensure_ascii=False)[:500]}")
+        
+        # استخراج بيانات الرسالة
+        message = data.get('message', {})
+        if not message:
+            logger.info("⚠️ لا توجد رسالة في البيانات")
+            return jsonify({'status': 'ignored'}), 200
+        
+        user_id = message.get('from', {}).get('id')
+        chat_id = message.get('chat', {}).get('id')
+        text = message.get('text', '').strip()
+        user_name = f"{message.get('from', {}).get('first_name', '')} {message.get('from', {}).get('last_name', '')}".strip()
+        
+        if not user_id or not chat_id:
+            logger.warning("⚠️ معرف مستخدم أو دردشة مفقود")
+            return jsonify({'status': 'error', 'message': 'Missing user_id or chat_id'}), 400
+        
+        # التحقق من حظر المستخدم
+        if UserManager.is_user_banned(user_id):
+            logger.info(f"⛔ مستخدم محظور {user_id} حاول إرسال رسالة")
+            MessageHandler.send_telegram_message(
+                chat_id, 
+                "❌ أنت محظور من استخدام هذا البوت."
+            )
+            return jsonify({'status': 'banned'}), 200
+        
+        # معالجة الرسالة الفارغة
+        if not text:
+            MessageHandler.send_telegram_message(
+                chat_id,
+                "⚠️ يرجى إرسال نص صالح للتحليل."
+            )
+            return jsonify({'status': 'empty_message'}), 200
+        
+        # الكشف عن المخالفات
+        has_violation, violations = SecurityManager.detect_violations(text)
+        
+        if has_violation:
+            logger.warning(f"🚨 مخالفة обнаружена للمستخدم {user_id}: {violations}")
+            ViolationManager.handle_violation(user_id, chat_id, text)
+            return jsonify({'status': 'violation_detected'}), 200
+        
+        # إرسال إلى Fasl AI
+        success = MessageHandler.send_to_fasl_ai(user_id, chat_id, text, user_name)
+        
+        if success:
+            MessageHandler.send_telegram_message(
+                chat_id,
+                "✅ تم استلام استفسارك وسيتم الرد قريباً."
+            )
+        else:
+            MessageHandler.send_telegram_message(
+                chat_id,
+                "⚠️ عذراً، حدث خطأ في معالجة طلبك. يرجى المحاولة لاحقاً."
+            )
+        
+        return jsonify({'status': 'processed'}), 200
+        
     except Exception as e:
-        logger.error(f"❌ Failed to send message: {e}")
-        return False
+        logger.error(f"❌ خطأ غير متوقع في webhook: {e}")
+        return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
 
-def edit_message_text(chat_id, message_id, text):
-    """تعديل رسالة موجودة"""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-    payload = {
-        'chat_id': chat_id,
-        'message_id': message_id,
-        'text': text,
-        'parse_mode': 'Markdown'
-    }
-    
+@app.route('/health', methods=['GET'])
+def health_check():
+    """نقطة فحص صحة التطبيق"""
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.status_code == 200
+        status = {
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'version': '2.0.0',
+            'services': {
+                'telegram': bool(TELEGRAM_TOKEN),
+                'n8n_webhook': bool(N8N_WEBHOOK_URL),
+                'manager_chat': bool(MANAGER_CHAT_ID)
+            },
+            'statistics': {
+                'total_users': len(users_db),
+                'active_warnings': len(user_warnings)
+            }
+        }
+        return jsonify(status), 200
     except Exception as e:
-        logger.error(f"❌ Failed to edit message: {e}")
-        return False
-
-def answer_callback_query(callback_query_id):
-    """الرد على callback query"""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
-    payload = {
-        'callback_query_id': callback_query_id
-    }
-    
-    try:
-        response = requests.post(url, json=payload, timeout=5)
-        return response.status_code == 200
-    except Exception as e:
-        logger.error(f"❌ Failed to answer callback: {e}")
-        return False
+        logger.error(f"❌ خطأ في health check: {e}")
+        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
 
 @app.route('/')
 def home():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>البوت القانوني</title>
-        <meta charset="utf-8">
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            .success { color: green; }
-            .error { color: red; }
-        </style>
-    </head>
-    <body>
-        <h1 class="success">✅ البوت القانوني يعمل!</h1>
-        <p><strong>🕒 الوقت:</strong> {}</p>
-        <p><strong>🔗 الروابط:</strong></p>
-        <ul>
-            <li><a href="/status">حالة النظام</a></li>
-            <li><a href="/set_webhook">تعيين Webhook</a></li>
-            <li><a href="/test">اختبار الإرسال</a></li>
-        </ul>
-        <p><strong>📊 الإحصائيات:</strong></p>
-        <ul>
-            <li>👥 المستخدمون: {}</li>
-            <li>⏳ بانتظار الموافقة: {}</li>
-        </ul>
-    </body>
-    </html>
-    """.format(
-        time.strftime('%Y-%m-%d %H:%M:%S'),
-        len(users_db),
-        sum(1 for u in users_db.values() if u.get('status') == 'pending')
-    )
+    """الصفحة الرئيسية"""
+    return jsonify({
+        'message': 'Legal Telegram Bot is running!',
+        'status': 'active',
+        'timestamp': datetime.now().isoformat()
+    })
 
-@app.route('/status')
-def status():
-    """حالة النظام - مبسط"""
-    try:
-        status_info = {
-            "status": "✅ يعمل",
-            "app_url": APP_URL,
-            "server_time": time.strftime('%Y-%m-%d %H:%M:%S'),
-            "users_count": len(users_db),
-            "pending_approvals": sum(1 for u in users_db.values() if u.get('status') == 'pending'),
-            "approved_users": sum(1 for u in users_db.values() if u.get('approved')),
-            "banned_users": sum(1 for u in users_db.values() if u.get('banned'))
-        }
-        return jsonify(status_info)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.errorhandler(404)
+def not_found(error):
+    """معالجة الأخطاء 404"""
+    return jsonify({'status': 'error', 'message': 'Endpoint not found'}), 404
 
-@app.route('/set_webhook')
-def set_webhook():
-    """تعيين webhook - مبسط"""
-    try:
-        webhook_url = f"{APP_URL}/webhook"
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-        
-        response = requests.post(url, json={'url': webhook_url})
-        
-        if response.status_code == 200:
-            return f"""
-            <h1 class="success">✅ تم تعيين Webhook!</h1>
-            <p><strong>الرابط:</strong> {webhook_url}</p>
-            <p><strong>الرد:</strong> {response.text}</p>
-            <a href="/">← العودة</a>
-            """
-        else:
-            return f"""
-            <h1 class="error">❌ فشل تعيين Webhook</h1>
-            <p><strong>الخطأ:</strong> {response.text}</p>
-            <a href="/">← العودة</a>
-            """
-    except Exception as e:
-        return f"""
-        <h1 class="error">❌ خطأ</h1>
-        <p><strong>التفاصيل:</strong> {str(e)}</p>
-        <a href="/">← العودة</a>
-        """
+@app.errorhandler(500)
+def internal_error(error):
+    """معالجة الأخطاء 500"""
+    logger.error(f"❌ خطأ داخلي في الخادم: {error}")
+    return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
 
-@app.route('/test')
-def test():
-    """اختبار إرسال رسالة"""
-    try:
-        if MANAGER_CHAT_ID:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            response = requests.post(url, json={
-                'chat_id': MANAGER_CHAT_ID,
-                'text': '🧪 اختبار: البوت يعمل بنجاح!'
-            })
-            
-            if response.status_code == 200:
-                return "<h1 class='success'>✅ تم إرسال رسالة الاختبار</h1><a href='/'>← العودة</a>"
-            else:
-                return f"<h1 class='error'>❌ فشل الإرسال: {response.text}</h1><a href='/'>← العودة</a>"
-        else:
-            return "<h1 class='error'>❌ MANAGER_CHAT_ID غير مضبوط</h1><a href='/'>← العودة</a>"
-    except Exception as e:
-        return f"<h1 class='error'>❌ خطأ: {str(e)}</h1><a href='/'>← العودة</a>"
-
-@app.route('/webhook', methods=['POST', 'GET'])
-def webhook():
-    """Webhook للتليجرام"""
-    if request.method == 'GET':
-        return "🟢 Webhook جاهز - POST فقط لبيانات التليجرام"
-    
-    try:
-        data = request.get_json()
-        logger.info("📩 بيانات واردة من التليجرام")
-        
-        if 'message' in data:
-            handle_message(data['message'])
-        elif 'callback_query' in data:
-            handle_callback(data['callback_query'])
-            
-    except Exception as e:
-        logger.error(f"❌ خطأ في webhook: {e}")
-    
-    return 'OK'
-
-def handle_message(message):
-    """معالجة الرسائل النصية"""
-    chat_id = message['chat']['id']
-    text = message.get('text', '')
-    user = message['from']
-    user_id = user['id']
-    
-    logger.info(f"💬 Message from {user_id}: {text}")
-    
-    if text == '/start':
-        handle_start_command(user, chat_id)
-    elif text and not text.startswith('/'):
-        handle_user_text(user_id, chat_id, text)
-
-def handle_start_command(user, chat_id):
-    """معالجة أمر /start"""
-    user_id = user['id']
-    
-    # التحقق إذا كان محظوراً
-    if users_db.get(user_id, {}).get('banned'):
-        send_telegram_message(chat_id, "❌ تم حظرك من استخدام البوت.")
-        return
-        
-    # إذا لم يكن معتمداً بعد
-    if user_id not in users_db or not users_db[user_id].get('approved'):
-        # إنشاء أزرار الموافقة
-        keyboard = {
-            'inline_keyboard': [[
-                {'text': '✅ قبول المستخدم', 'callback_data': f'approve_{user_id}'},
-                {'text': '❌ رفض المستخدم', 'callback_data': f'reject_{user_id}'}
-            ]]
-        }
-        
-        send_telegram_message(
-            MANAGER_CHAT_ID,
-            f"🆕 طلب انضمام جديد:\n👤 {user['first_name']}\n🆔 {user_id}",
-            keyboard
-        )
-        
-        users_db[user_id] = {
-            'first_name': user['first_name'],
-            'username': user.get('username'),
-            'status': 'pending',
-            'chat_id': chat_id
-        }
-        
-        send_telegram_message(chat_id, "⏳ تم إرسال طلبك للمدير. انتظر الموافقة.")
-        
-    else:
-        show_main_menu(chat_id)
-
-def show_main_menu(chat_id):
-    """عرض القائمة الرئيسية المحسنة"""
-    keyboard = {
-        'inline_keyboard': [
-            # الصف الأول: الخدمات الأساسية
-            [
-                {'text': '📞 استشارة فورية', 'callback_data': 'consult'},
-                {'text': '⚖️ خدمات قانونية', 'callback_data': 'services'}
-            ],
-            # الصف الثاني: معلومات وإجراءات
-            [
-                {'text': '❓ الأسئلة الشائعة', 'callback_data': 'faq'},
-                {'text': '💰 التكاليف', 'callback_data': 'pricing'}
-            ],
-            # الصف الثالث: معلومات الاتصال
-            [
-                {'text': '🏢 عن المكتب', 'callback_data': 'about'},
-                {'text': '📞 اتصل بنا', 'callback_data': 'contact'}
-            ],
-            # الصف الرابع: إضافات مهمة
-            [
-                {'text': '📝 حجز موعد', 'callback_data': 'appointment'},
-                {'text': '🔒 الخصوصية', 'callback_data': 'privacy'}
-            ],
-            # الصف الخامس: المساعدة
-            [
-                {'text': '🆘 مساعدة عاجلة', 'callback_data': 'emergency'},
-                {'text': '📋 الشروط', 'callback_data': 'terms'}
-            ]
-        ]
-    }
-    
-    message_text = """
-👋 أهلاً وسهلاً بك في *البوت القانوني المتخصص*
-
-🎯 *اختر من القائمة أدناه:*
-
-• 📞 *استشارة فورية* - للحصول على إجابة سريعة
-• ⚖️ *خدمات قانونية* - تعرف على كافة خدماتنا
-• ❓ *الأسئلة الشائعة* - إجابات على أكثر الاستفسارات شيوعاً
-• 💰 *التكاليف* - معرفة الرسوم والتكاليف
-• 🏢 *عن المكتب* - تعرف على فريقنا
-• 📞 *اتصل بنا* - طرق التواصل المباشر
-• 📝 *حجز موعد* - ترتيب جلسة استشارية
-• 🔒 *الخصوصية* - سياسة الخصوصية والأمان
-• 🆘 *مساعدة عاجلة* - للحالات الطارئة
-• 📋 *الشروط* - الشروط والأحكام
-
-*اختر الخدمة التي تناسب احتياجك:*
-"""
-    
-    send_telegram_message(chat_id, message_text, keyboard)
-
-def handle_callback(callback_query):
-    """معالجة ضغطات الأزرار المحسنة"""
-    data = callback_query['data']
-    user_id = callback_query['from']['id']
-    message_id = callback_query['message']['message_id']
-    chat_id = callback_query['message']['chat']['id']
-    
-    answer_callback_query(callback_query['id'])
-    
-    try:
-        if data.startswith('approve_'):
-            target_user_id = int(data.split('_')[1])
-            users_db[target_user_id] = {'approved': True, 'warnings': 0}
-            
-            user_chat_id = users_db.get(target_user_id, {}).get('chat_id', target_user_id)
-            send_telegram_message(user_chat_id, "🎉 تم قبولك! اكتب /start")
-            edit_message_text(chat_id, message_id, f"✅ تم قبول {target_user_id}")
-            
-        elif data.startswith('reject_'):
-            target_user_id = int(data.split('_')[1])
-            users_db[target_user_id] = {'banned': True}
-            
-            user_chat_id = users_db.get(target_user_id, {}).get('chat_id', target_user_id)
-            send_telegram_message(user_chat_id, "❌ تم رفض طلبك")
-            edit_message_text(chat_id, message_id, f"❌ تم رفض {target_user_id}")
-            
-        elif data == "consult":
-            edit_message_text(
-                chat_id,
-                message_id,
-                "📞 *الاستشارة الفورية*\n\nيمكنك الآن وصف مشكلتك القانونية بالتفصيل، وسيقوم أحد محامينا المتخصصين بالرد عليك في أقرب وقت.\n\nيرجى تضمين:\n• نوع القضية أو المشكلة\n• الأطراف المتضمنة\n• التسلسل الزمني للأحداث\n• أي مستندات متوفرة لديك\n\n⬇️ *اكتب رسالتك الآن...*"
-            )
-            
-        elif data == "services":
-            edit_message_text(
-                chat_id,
-                message_id,
-                "⚖️ *خدماتنا القانونية المتكاملة*\n\n*📝 صياغة العقود:*\n• عقود العمل والخدمات\n• عقود الشركات والمشاريع\n• عقود البيع والشراء\n• عقود الإيجار والتمويل\n\n*🏛️ المرافعات القضائية:*\n• الدفاع في القضايا الجنائية\n• القضايا التجارية والمالية\n• قضايا الأحوال الشخصية\n• المنازعات العقارية\n\n*💼 الاستشارات المتخصصة:*\n• استشارات شركات وأعمال\n• استشارات عقارية\n• استشارات ضريبية وجمركية\n• استشارات ملكية فكرية\n\n*📄 التوثيق والتصديق:*\n• توثيق العقود والاتفاقيات\n• تصديق المستندات الرسمية\n• التوثيق لدى الجهات الحكومية\n\nاختر '📞 استشارة فورية' لبدء الخدمة المناسبة لك."
-            )
-            
-        elif data == "about":
-            edit_message_text(
-                chat_id,
-                message_id,
-                "🏢 *عن المكتب والمحامين*\n\nنحن فريق من المحامين المتخصصين في مختلف المجالات القانونية، نقدم خدماتنا باحترافية وشفافية.\n\n*رؤيتنا:* أن نكون الخيار الأول للخدمات القانونية.\n\n*رسالتنا:* تقديم حلول قانونية مبتكرة تلبي احتياجات عملائنا.\n\n*فريقنا:*\n• محامون متخصصون في كافة المجالات\n• خبرة تزيد عن 15 عاماً\n• متابعة مستمرة للقضايا\n\n📞 للتواصل المباشر:\nالهاتف: +966123456789\nالبريد: info@lawfirm.com\n\n🕐 أوقات العمل:\nمن الأحد إلى الخميس\n8:00 ص - 6:00 م"
-            )
-            
-        elif data == "appointment":
-            edit_message_text(
-                chat_id,
-                message_id,
-                "📝 *حجز موعد استشارة*\n\nلحجز موعد مع محامٍ متخصص، يرجى:\n\n📞 *الاتصال على:* +966123456789\n📧 *المراسلة على:* appointments@lawfirm.com\n\n*أو يمكنك إرسال:*\n• الاسم الكامل\n• نوع الاستشارة\n• التاريخ والوقت المناسب\n• طريقة التواصل المفضلة\n\n*بعد الحجز:*\n• سنرسل لك تأكيد الحجز\n• تذكير قبل الموعد بيوم\n• مرونة في تغيير الموعد\n\n*المواعيد المتاحة:*\n• الأحد - الخميس: 8:00 ص - 6:00 م\n• الجلسات عن بُعد متاحة\n\nوسنتواصل معك لتأكيد الموعد."
-            )
-            
-        elif data == "faq":
-            handle_faq(chat_id, message_id)
-            
-        elif data == "pricing":
-            handle_pricing(chat_id, message_id)
-            
-        elif data == "contact":
-            handle_contact(chat_id, message_id)
-            
-        elif data == "emergency":
-            handle_emergency(chat_id, message_id)
-            
-        elif data == "privacy":
-            handle_privacy(chat_id, message_id)
-            
-        elif data == "terms":
-            handle_terms(chat_id, message_id)
-            
-    except Exception as e:
-        logger.error(f"❌ خطأ في معالجة الزر: {e}")
-
-def handle_faq(chat_id, message_id):
-    """عرض الأسئلة الشائعة"""
-    faq_text = """
-❓ *الأسئلة الشائعة*
-
-*Q1: ما هي مدة الاستشارة؟*
-• الاستشارة الأولية تستغرق عادة 15-30 دقيقة
-
-*Q2: كيف يتم تحديد التكلفة؟*
-• حسب نوع الخدمة وتعقيد القضية
-
-*Q3: هل الاستشارة الأولية مجانية؟*
-• نعم، الاستشارة الأولية مجانية
-
-*Q4: ما هي أوقات العمل؟*
-• الأحد - الخميس: 8:00 ص - 6:00 م
-
-*Q5: كيف أستلم المستندات؟*
-• يتم إرسالها عبر البريد الإلكتروني أو الواتساب
-
-*Q6: هل تتعاملون مع القضايا العاجلة؟*
-• نعم، لدينا خدمة الطوارئ للقضايا العاجلة
-
-للاستفسارات الأخرى، اختر '📞 استشارة فورية'
-"""
-    edit_message_text(chat_id, message_id, faq_text)
-
-def handle_pricing(chat_id, message_id):
-    """عرض التكاليف والرسوم"""
-    pricing_text = """
-💰 *التكاليف والرسوم*
-
-*الاستشارات:*
-• 📞 استشارة أولية: *مجانية*
-• 💼 استشارة مفصلة: 200 - 500 ريال
-• 🏛️ استشارة متخصصة: 500 - 1000 ريال
-
-*صياغة المستندات:*
-• 📝 عقد بسيط: 300 - 800 ريال
-• 📄 عقد متقدم: 800 - 2000 ريال
-• 🏠 عقود عقارية: 1000 - 3000 ريال
-
-*المرافعات:*
-• ⚖️ قضية بسيطة: 2000 - 5000 ريال
-• 🔥 قضية متوسطة: 5000 - 15000 ريال
-• 🚨 قضية معقدة: 15000+ ريال
-
-*ملاحظة:* 
-- الأسعار تختلف حسب تعقيد القضية
-- الدفع بعد الاتفاق على الخدمة
-- تقسيط متاح للقضايا الكبيرة
-
-للحصول على سعر دقيق، اختر '📞 استشارة فورية'
-"""
-    edit_message_text(chat_id, message_id, pricing_text)
-
-def handle_contact(chat_id, message_id):
-    """عرض معلومات الاتصال"""
-    contact_text = """
-📞 *طرق التواصل معنا*
-
-*للتواصل المباشر:*
-• 📞 الهاتف: `+966 12 345 6789`
-• 📧 البريد: `info@lawfirm.com`
-• 🌐 الموقع: `www.lawfirm.com`
-
-*وسائل التواصل الاجتماعي:*
-• 📱 واتساب: `+966 12 345 6789`
-• 💼 لينكد إن: `LawFirmKSA`
-• 📸 إنستغرام: `@LawFirmKSA`
-
-*العنوان:*
-• 🏢 المملكة العربية السعودية
-• 📍 الرياض - حي العليا
-• 🗺️ شارع الملك فهد
-
-*أوقات العمل:*
-• ⏰ الأحد - الخميس: 8:00 ص - 6:00 م
-• 🕛 الجمعة - السبت: إجازة
-
-*للحالات الطارئة خارج أوقات العمل:*
-• 🆘 هاتف الطوارئ: `+966 50 123 4567`
-
-نحن هنا لخدمتك على مدار الساعة!
-"""
-    edit_message_text(chat_id, message_id, contact_text)
-
-def handle_emergency(chat_id, message_id):
-    """عرض مساعدة الطوارئ"""
-    emergency_text = """
-🆘 *مساعدة عاجلة*
-
-*للحالات الطارئة:*
-
-📞 *اتصل فوراً على:*
-• هاتف الطوارئ: `+966 50 123 4567`
-• الهاتف الرئيسي: `+966 12 345 6789`
-
-*الحالات التي نتعامل معها عاجلاً:*
-• 🚨 اعتقال أو توقيف
-• ⚖️ قضايا جنائية عاجلة
-• 🏠 إخلاء أو طرد
-• 💼 تجميد أموال أو حسابات
-• 📄 استدعاء قضائي مفاجئ
-
-*ما يجب فعله في الحالات الطارئة:*
-1. ✅ احتفظ بجميع المستندات
-2. ✅ سجل جميع التفاصيل
-3. ✅ لا توقع على أي أوراق قبل استشارتنا
-4. ✅ تواصل معنا فوراً
-
-*خدمة 24/7:*
-نقدم خدمة الطوارئ على مدار الساعة طوال أيام الأسبوع للحالات العاجلة.
-
-*اتصل بنا الآن للاستشارة العاجلة!*
-"""
-    edit_message_text(chat_id, message_id, emergency_text)
-
-def handle_privacy(chat_id, message_id):
-    """عرض سياسة الخصوصية"""
-    privacy_text = """
-🔒 *سياسة الخصوصية والأمان*
-
-*حماية بياناتك:*
-• 🔐 جميع محادثاتك مشفرة وآمنة
-• 📁 ملفاتك محفوظة بسرية تامة
-• 👥 لا نشارك بياناتك مع أي طرف ثالث
-
-*مبدأ السرية:*
-• جميع المحامين ملتزمون بمبدأ السرية المهنية
-• معلوماتك محمية بموجب النظام
-• نلتزم بأعلى معايير الأمان
-
-*حقوقك:*
-•你有权利 الاطلاع على بياناتك
-• لك الحق في طلب حذف بياناتك
-• يمكنك سحب الموافقة في أي وقت
-
-*التخزين:*
-• يتم تخزين البيانات على خوادم آمنة
-• فترة الاحتفاظ: 5 سنوات حسب النظام
-• يتم التدمير الآمن بعد انتهاء المدة
-
-نحن نحرص على حماية خصوصيتك وأمان بياناتك.
-"""
-    edit_message_text(chat_id, message_id, privacy_text)
-
-def handle_terms(chat_id, message_id):
-    """عرض الشروط والأحكام"""
-    terms_text = """
-📋 *الشروط والأحكام*
-
-*شروط استخدام الخدمة:*
-• ✅ يجب أن تكون المعلومات المقدمة صحيحة
-• ✅ الالتزام بمواعيد الجلسات
-• ✅ دفع الرسوم المتفق عليها
-
-*التزاماتنا:*
-• نقدم الاستشارات بدقة واحترافية
-• نحافظ على سرية معلوماتك
-• نلتزم بالمواعيد المتفق عليها
-
-*مسؤوليات العميل:*
-• تقديم المعلومات الصحيحة والكاملة
-• الالتزام بالدفعات المتفق عليها
-• إبلاغنا بأي تغييرات مهمة
-
-*إخلاء المسؤولية:*
-• الاستشارات لا تغني عن المراجعة الكاملة
-• النتائج تختلف حسب ظروف كل قضية
-• نعمل ضمن الإطار القانوني
-
-*الدفع والمقابل:*
-• الدفع بعد الاتفاق على الخدمة
-• تقسيط متاح للقضايا الكبيرة
-• لا استرداد للرسوم بعد تقديم الخدمة
-
-بالاستمرار في استخدام الخدمة، فإنك توافق على هذه الشروط.
-"""
-    edit_message_text(chat_id, message_id, terms_text)
-
-def handle_user_text(user_id, chat_id, text):
-    """معالجة الرسائل النصية من المستخدمين مع التكامل مع Fasl AI"""
-    # التحقق من صلاحية المستخدم
-    if user_id not in users_db or not users_db[user_id].get('approved'):
-        send_telegram_message(chat_id, "⏳ لا يمكنك استخدام البوت حتى يتم الموافقة على طلبك.")
-        return
-    
-    # فحص المحتوى المحظور (فحص أولي)
-    forbidden_words = ["http://", "https://", ".com", ".org", "سب", "شتم", "قذف", "شتيمة"]
-    for word in forbidden_words:
-        if word in text.lower():
-            # التعامل مع المخالفة محلياً
-            handle_violation(user_id, chat_id, text)
-            return
-    
-    # إذا كانت الرسالة نظيفة، إرسال إلى Fasl AI
-    user_name = users_db[user_id].get('first_name', '')
-    
-    # إرسال رسالة انتظار
-    send_telegram_message(
-        chat_id, 
-        "⚖️ *جارِ تحليل استشارتك القانونية...*\n\n"
-        "🤖 نظام Fasl AI يعمل على تحليل طلبك وتقديم أفضل استشارة قانونية.\n\n"
-        "⏳ *الوقت المتوقع:* 10-30 ثانية"
-    )
-    
-    # إرسال إلى n8n
-    success = send_to_fasl_ai(user_id, user_name, chat_id, text)
-    
-    if not success:
-        send_telegram_message(
-            chat_id,
-            "⚠️ *عذراً، حدث خطأ في النظام*\n\n"
-            "يرجى المحاولة مرة أخرى بعد قليل أو التواصل مع الدعم.\n\n"
-            "مع خالص التحية،\n"
-            "فَصْل | Fasl ⚖️ المستشار القانوني الذكي."
-        )
-    )
-import requests  # تأكد من وجود هذا الاستيراد في أعلى الملف
-
-def send_to_fasl_ai(user_id, user_name, chat_id, text, message_id=None):
-    """إرسال الرسالة إلى نظام Fasl AI على n8n"""
-    try:
-        # ⚠️ استبدل هذا الرابط برابط n8n الفعلي
-        n8n_webhook_url = "https://your-n8n-domain.com/webhook/fasl-ai-webhook"
-        
-        payload = {
-            'message': {
-                'text': text,
-                'message_id': message_id
-            },
-            'chat': {
-                'id': chat_id
-            },
-            'from': {
-                'id': user_id,
-                'first_name': user_name.split(' ')[0] if user_name else '',
-                'last_name': ' '.join(user_name.split(' ')[1:]) if user_name and ' ' in user_name else ''
-            }
-        }
-        
-        headers = {
-            'Content-Type': 'application/json',
-            'X-Telegram-Token': os.getenv('TELEGRAM_WEBHOOK_SECRET', 'default-secret')
-        }
-        
-        response = requests.post(
-            n8n_webhook_url, 
-            json=payload, 
-            headers=headers,
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            logger.info(f"✅ تم إرسال الرسالة إلى Fasl AI للمستخدم {user_id}")
-            return True
-        else:
-            logger.error(f"❌ فشل إرسال الرسالة إلى Fasl AI: {response.status_code} - {response.text}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"❌ خطأ في إرسال الرسالة إلى Fasl AI: {e}")
-        return False
-
-def handle_violation(user_id, chat_id, text):
-    """معالجة المخالفات محلياً قبل إرسالها إلى n8n"""
-    # زيادة التحذيرات
-    if user_id not in user_warnings:
-        user_warnings[user_id] = 0
-    user_warnings[user_id] += 1
-    
-    warnings = user_warnings[user_id]
-    
-    if warnings >= 3:
-        # حظر المستخدم
-        users_db[user_id]['banned'] = True
-        send_telegram_message(
-            chat_id, 
-            "❌ تم حظرك من البوت due to repeated violations."
-        )
-        
-        # إشعار المدير
-        send_telegram_message(
-            MANAGER_CHAT_ID,
-            f"🚨 تم حظر المستخدم {user_id}\nالسبب: repeated violations\nآخر رسالة: {text[:100]}..."
-        )
-        return True
-    else:
-        send_telegram_message(
-            chat_id,
-            f"⚠️ تحذير ({warnings}/3): يمنع مشاركة روابط أو كلمات غير لائقة.\nالتكرار يؤدي إلى الحظر الدائم."
-        )
-        
-        # إشعار المدير
-        send_telegram_message(
-            MANAGER_CHAT_ID,
-            f"⚠️ مخالفة من المستخدم {user_id}\nالتحذيرات: {warnings}/3\nالرسالة: {text[:200]}..."
-        )
-        return False
 if __name__ == '__main__':
+    # التحقق من المتغيرات البيئية الأساسية
+    required_vars = ['TELEGRAM_TOKEN']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        logger.error(f"❌ متغيرات بيئية مفقودة: {missing_vars}")
+        logger.warning("⚠️ البوت قد لا يعمل بشكل صحيح بدون هذه المتغيرات")
+    
     # بدء نظام keep-alive
     keep_alive()
     
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"🚀 بدء تشغيل البوت على المنفذ {port}")
     logger.info(f"🌐 عنوان التطبيق: {APP_URL}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    logger.info(f"📊 عدد المستخدمين المسجلين: {len(users_db)}")
+    
+    try:
+        app.run(
+            host='0.0.0.0', 
+            port=port, 
+            debug=False,
+            threaded=True
+        )
+    except Exception as e:
+        logger.error(f"❌ فشل تشغيل التطبيق: {e}")
+        raise
