@@ -570,53 +570,124 @@ def handle_terms(chat_id, message_id):
     edit_message_text(chat_id, message_id, terms_text)
 
 def handle_user_text(user_id, chat_id, text):
-    """معالجة الرسائل النصية من المستخدمين"""
+    """معالجة الرسائل النصية من المستخدمين مع التكامل مع Fasl AI"""
     # التحقق من صلاحية المستخدم
     if user_id not in users_db or not users_db[user_id].get('approved'):
         send_telegram_message(chat_id, "⏳ لا يمكنك استخدام البوت حتى يتم الموافقة على طلبك.")
         return
     
-    # فحص المحتوى المحظور
+    # فحص المحتوى المحظور (فحص أولي)
     forbidden_words = ["http://", "https://", ".com", ".org", "سب", "شتم", "قذف", "شتيمة"]
     for word in forbidden_words:
         if word in text.lower():
-            # زيادة التحذيرات
-            if user_id not in user_warnings:
-                user_warnings[user_id] = 0
-            user_warnings[user_id] += 1
-            
-            warnings = user_warnings[user_id]
-            
-            if warnings >= 3:
-                # حظر المستخدم
-                users_db[user_id]['banned'] = True
-                send_telegram_message(chat_id, "❌ تم حظرك من البوت due to repeated violations.")
-                
-                # إشعار المدير
-                send_telegram_message(
-                    MANAGER_CHAT_ID,
-                    f"🚨 تم حظر المستخدم {user_id}\nالسبب: repeated violations\nآخر رسالة: {text[:100]}..."
-                )
-                return
-            else:
-                send_telegram_message(
-                    chat_id,
-                    f"⚠️ تحذير ({warnings}/3): يمنع مشاركة روابط أو كلمات غير لائقة.\nالتكرار يؤدي إلى الحظر الدائم."
-                )
-                
-                # إشعار المدير
-                send_telegram_message(
-                    MANAGER_CHAT_ID,
-                    f"⚠️ مخالفة من المستخدم {user_id}\nالتحذيرات: {warnings}/3\nالرسالة: {text[:200]}..."
-                )
-                return
+            # التعامل مع المخالفة محلياً
+            handle_violation(user_id, chat_id, text)
+            return
     
-    # إذا كانت الرسالة نظيفة
+    # إذا كانت الرسالة نظيفة، إرسال إلى Fasl AI
+    user_name = users_db[user_id].get('first_name', '')
+    
+    # إرسال رسالة انتظار
     send_telegram_message(
-        chat_id,
-        "✅ تم استلام رسالتك بنجاح.\n\nسيقوم أحد محامينا المتخصصين بالرد عليك في أقرب وقت ممكن.\n\nشكراً لثقتك بمكتبنا القانوني."
+        chat_id, 
+        "⚖️ *جارِ تحليل استشارتك القانونية...*\n\n"
+        "🤖 نظام Fasl AI يعمل على تحليل طلبك وتقديم أفضل استشارة قانونية.\n\n"
+        "⏳ *الوقت المتوقع:* 10-30 ثانية"
     )
+    
+    # إرسال إلى n8n
+    success = send_to_fasl_ai(user_id, user_name, chat_id, text)
+    
+    if not success:
+        send_telegram_message(
+            chat_id,
+            "⚠️ *عذراً، حدث خطأ في النظام*\n\n"
+            "يرجى المحاولة مرة أخرى بعد قليل أو التواصل مع الدعم.\n\n"
+            "مع خالص التحية،\n"
+            "فَصْل | Fasl ⚖️ المستشار القانوني الذكي."
+        )
+    )
+import requests  # تأكد من وجود هذا الاستيراد في أعلى الملف
 
+def send_to_fasl_ai(user_id, user_name, chat_id, text, message_id=None):
+    """إرسال الرسالة إلى نظام Fasl AI على n8n"""
+    try:
+        # ⚠️ استبدل هذا الرابط برابط n8n الفعلي
+        n8n_webhook_url = "https://your-n8n-domain.com/webhook/fasl-ai-webhook"
+        
+        payload = {
+            'message': {
+                'text': text,
+                'message_id': message_id
+            },
+            'chat': {
+                'id': chat_id
+            },
+            'from': {
+                'id': user_id,
+                'first_name': user_name.split(' ')[0] if user_name else '',
+                'last_name': ' '.join(user_name.split(' ')[1:]) if user_name and ' ' in user_name else ''
+            }
+        }
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Telegram-Token': os.getenv('TELEGRAM_WEBHOOK_SECRET', 'default-secret')
+        }
+        
+        response = requests.post(
+            n8n_webhook_url, 
+            json=payload, 
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"✅ تم إرسال الرسالة إلى Fasl AI للمستخدم {user_id}")
+            return True
+        else:
+            logger.error(f"❌ فشل إرسال الرسالة إلى Fasl AI: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ خطأ في إرسال الرسالة إلى Fasl AI: {e}")
+        return False
+
+def handle_violation(user_id, chat_id, text):
+    """معالجة المخالفات محلياً قبل إرسالها إلى n8n"""
+    # زيادة التحذيرات
+    if user_id not in user_warnings:
+        user_warnings[user_id] = 0
+    user_warnings[user_id] += 1
+    
+    warnings = user_warnings[user_id]
+    
+    if warnings >= 3:
+        # حظر المستخدم
+        users_db[user_id]['banned'] = True
+        send_telegram_message(
+            chat_id, 
+            "❌ تم حظرك من البوت due to repeated violations."
+        )
+        
+        # إشعار المدير
+        send_telegram_message(
+            MANAGER_CHAT_ID,
+            f"🚨 تم حظر المستخدم {user_id}\nالسبب: repeated violations\nآخر رسالة: {text[:100]}..."
+        )
+        return True
+    else:
+        send_telegram_message(
+            chat_id,
+            f"⚠️ تحذير ({warnings}/3): يمنع مشاركة روابط أو كلمات غير لائقة.\nالتكرار يؤدي إلى الحظر الدائم."
+        )
+        
+        # إشعار المدير
+        send_telegram_message(
+            MANAGER_CHAT_ID,
+            f"⚠️ مخالفة من المستخدم {user_id}\nالتحذيرات: {warnings}/3\nالرسالة: {text[:200]}..."
+        )
+        return False
 if __name__ == '__main__':
     # بدء نظام keep-alive
     keep_alive()
