@@ -1,113 +1,62 @@
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes,
-)
+from flask import Flask, request
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# بيانات البيئة (توكن البوت)
+# إعداد المتغيرات
 TOKEN = os.getenv("BOT_TOKEN")
+RAILWAY_URL = os.getenv("RAILWAY_URL")  # مثال: https://yourapp-production.up.railway.app
 
-# يمكنك وضع ID الأدمن مباشرة أو من environment variable
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))  # ضع رقمك هنا
-
-# القوائم لحفظ المستخدمين مؤقتًا
-pending_users = {}
-approved_users = set()
+app = Flask(__name__)
+application = Application.builder().token(TOKEN).build()
 
 
-# 🟢 أمر /start
+# ====== أوامر البوت الأساسية ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-
-    if chat_id in approved_users:
-        await update.message.reply_text("مرحباً بك مجددًا ✅")
-        return
-
-    # إرسال إشعار للأدمن
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ قبول", callback_data=f"accept_{chat_id}"),
-            InlineKeyboardButton("❌ رفض", callback_data=f"reject_{chat_id}")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"طلب جديد من المستخدم:\n"
-             f"👤 الاسم: {user.first_name}\n"
-             f"🆔 ID: {chat_id}",
-        reply_markup=reply_markup
+    await update.message.reply_text(
+        "👋 مرحبًا بك في المستشار القانوني الذكي.\n"
+        "أنا هنا لمساعدتك في استشاراتك القانونية باحترافية ودقة عالية."
     )
 
-    pending_users[chat_id] = user.first_name
-    await update.message.reply_text("🔒 تم إرسال طلبك للإدارة، الرجاء الانتظار حتى يتم قبولك.")
 
-
-# 🔘 التعامل مع القبول / الرفض
-async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if not data.startswith(("accept_", "reject_")):
-        return
-
-    target_id = int(data.split("_")[1])
-
-    if query.from_user.id != ADMIN_ID:
-        await query.edit_message_text("❌ ليس لديك صلاحية لهذا الإجراء.")
-        return
-
-    if data.startswith("accept_"):
-        approved_users.add(target_id)
-        pending_users.pop(target_id, None)
-        await context.bot.send_message(
-            chat_id=target_id,
-            text="✅ تم قبولك! يمكنك الآن استخدام البوت بحرية."
-        )
-        await query.edit_message_text("✅ تم قبول المستخدم بنجاح.")
-    else:
-        pending_users.pop(target_id, None)
-        await context.bot.send_message(
-            chat_id=target_id,
-            text="❌ تم رفض طلبك. يمكنك المحاولة لاحقًا."
-        )
-        await query.edit_message_text("🚫 تم رفض المستخدم.")
-
-
-# 📩 استقبال الرسائل بعد القبول
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id not in approved_users:
-        await update.message.reply_text("❗ أنت غير مقبول بعد. أرسل /start لتقديم طلب.")
-        return
-
     text = update.message.text
-    await update.message.reply_text(f"📨 رسالتك تم استلامها: {text}")
 
-
-# 🚀 تشغيل التطبيق
-def main():
-    if not TOKEN:
-        print("❌ خطأ: BOT_TOKEN غير موجود في المتغيرات.")
+    # منع الإساءات
+    bad_words = ["لعن", "قذف", "سب", "شت", "حقير", "سخيف"]
+    if any(word in text for word in bad_words):
+        await update.message.reply_text(
+            "⚠️ تنبيه: يُرجى الالتزام بالاحترام. تكرار المخالفة سيؤدي إلى الحظر."
+        )
         return
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    # الرد الذكي المؤقت
+    response = f"📘 تم استلام سؤالك القانوني:\n\n«{text}»\n\nسيتم تحليله وإعطاؤك الرد المناسب."
+    await update.message.reply_text(response)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_decision))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 البوت يعمل الآن ...")
-    app.run_polling()
+# إضافة المعالجات
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+
+# ====== إعداد Flask للـ Webhook ======
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    """تستقبل التحديثات من Telegram"""
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put_nowait(update)
+    return "ok", 200
+
+
+@app.route("/")
+def set_webhook():
+    """ضبط Webhook تلقائيًا عند تشغيل السيرفر"""
+    webhook_url = f"{RAILWAY_URL}/{TOKEN}"
+    application.bot.set_webhook(url=webhook_url)
+    return f"✅ Webhook set to {webhook_url}", 200
 
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
