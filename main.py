@@ -603,3 +603,35 @@ if __name__ == '__main__':
     logger.info(f"🚀 بدء تشغيل {BOT_NAME} على المنفذ {port}")
     logger.info(f"🌐 عنوان التطبيق: {APP_URL}")
     app.run(host='0.0.0.0', port=port, debug=False)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+BOT_TOKEN = "YOUR_TOKEN"
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("قبول ✅", callback_data="accept"),
+            InlineKeyboardButton("رفض ❌", callback_data="reject"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("تم انضمام مستخدم جديد، هل تقبله؟", reply_markup=reply_markup)
+
+async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()  # ضروري لتأكيد الضغط
+
+    if query.data == "accept":
+        await query.edit_message_text("✅ تم قبول المستخدم بنجاح.")
+    elif query.data == "reject":
+        await query.edit_message_text("❌ تم رفض المستخدم.")
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_decision))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
